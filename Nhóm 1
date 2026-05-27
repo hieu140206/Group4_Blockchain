@@ -1,1 +1,224 @@
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.7.0 <0.9.0;
+// Phần 1: HỢP ĐỒNG CON (Quản lý 1 món đồ/1 phiên thuê)
+contract RentalAgreement {
+    enum State {Available, Rented, Returned, Negotiating, Disputed, Completed}
 
+// Biến trạng thái
+    address payable public owner; //Chủ tài sản
+    address payable public renter; //Khách đi thuê
+    address public arbitrator; //Admin nền tảng (Trọng tài xử lý chanh chấp)
+
+    uint256 public rentPrice; //Giá thuê
+    uint256 public deposit; //Tiền cọc bảo đảm
+    uint256 public claimAmount; //Tổng số tiền phạt (Phạt trễ hạn + Phạt hư hỏng)
+    uint256 public lateFeePerDay; //Mức phí phạt nếu trả trễ (Tính trên mỗi ngày)
+
+    uint256 public rentStartTime; //Thời điểm bắt đầu thuê
+    uint256 public rentEndTime; // Thời điểm cam kết trả đồ
+    uint256 public returnedTime; // Thời điểm khách thực tế bấm trả đồ
+
+    uint256 public claimWindow; // Khung thời gian cho phép chủ đồ test đồ (giây)
+    uint256 public timeoutDuration; // Thời hạn tối đa trước khi chốt sổ khẩn cấp (giây)
+
+    State public state;
+
+// Event
+    event Rented(address indexed renter, uint256 startTime, uint256 endTime);
+    event Returned(uint256 time, uint256 latePenaltyApplied);
+    event DamageClaimed(uint256 amount);
+    event Disputed();
+    event Completed(uint256 ownerReceived, uint256 renterReceived);
+    event EmergencyResolved();
+
+// Bộ lọc quyền truy cập
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Chi Chu tai san moi duoc phep goi ham nay.");
+        _;
+    }
+
+    modifier onlyRenter() {
+        require(msg.sender == renter, "Chi Khach thue moi duoc phep goi ham nay.");
+        _;
+    }
+
+    modifier onlyParty() {
+        require(msg.sender == owner || msg.sender == renter, "Chi Nguoi trong cuoc moi duoc phep.");
+        _;
+    }
+
+    modifier onlyArbitrator() {
+        require(msg.sender == arbitrator, "Chi Admin moi duoc phep phan xu.");
+        _;
+    }
+
+    modifier inState(State _state) {
+        require(state == _state, "Trang thai hop dong hien tai khong hop le cho hanh dong nay.");
+        _;
+    }
+
+// Hàm khởi tạo
+    constructor(
+        address _owner, 
+        address _arbitrator, 
+        uint256 _rentPrice, 
+        uint256 _deposit,
+        uint256 _claimWindow,
+        uint256 _timeoutDuration,
+        uint256 _lateFeePerDay
+    ) {
+        owner = payable(_owner);
+        arbitrator = _arbitrator;
+        rentPrice = _rentPrice;
+        deposit = _deposit;
+        claimWindow = _claimWindow;
+        timeoutDuration = _timeoutDuration;
+        lateFeePerDay = _lateFeePerDay;
+        state = State.Available;
+    }
+
+// Các hàm nghiệp vụ chính 
+// [BƯỚC 1] Khách bấm thuê, nạp tiền và chốt thời gian
+    function rentItem(uint256 _durationInSeconds) public payable inState(State.Available) {
+        require(msg.sender != owner, "Chu tai san khong the tu thue.");
+        require(msg.value == (rentPrice + deposit), "Nap thieu tien. Phai bang Gia thue + Tien coc.");
+
+        renter = payable(msg.sender);
+        rentStartTime = block.timestamp; 
+        rentEndTime = block.timestamp + _durationInSeconds; 
+        state = State.Rented;
+
+        emit Rented(msg.sender, rentStartTime, rentEndTime);
+    }
+// [BƯỚC 2] Khách xác nhận trả đồ -> Tính phạt trễ hạn tự động & Bấm giờ kiểm tra
+    function returnItem() public onlyRenter inState(State.Rented) {
+        uint256 penalty = 0;
+        
+        // Kiem tra neu bi tre han
+        if (block.timestamp > rentEndTime) {
+            uint256 overdueSeconds = block.timestamp - rentEndTime;
+            uint256 overdueDays = (overdueSeconds / 1 days) + 1; // Lam tron len 1 ngay
+            
+            penalty = overdueDays * lateFeePerDay;
+
+            if (penalty > deposit) {
+                penalty = deposit;
+            }
+
+            claimAmount += penalty; // Cong vao tong phat
+        }
+
+        returnedTime = block.timestamp; // Ghi nhan mốc thoi gian tra do de Chu do vao kiem tra
+        state = State.Returned;
+        
+        emit Returned(block.timestamp, penalty);
+    }
+// [KỊCH BẢN A] Không hư hỏng, Chủ xác nhận -> Chia tiền
+    function confirmReceipt() public onlyOwner inState(State.Returned) {
+        require(claimAmount <= deposit, "Loi: Tien phat vuot qua coc.");
+
+        state = State.Completed;
+
+        owner.transfer(rentPrice + claimAmount);      
+        renter.transfer(deposit - claimAmount);       
+
+        emit Completed(rentPrice + claimAmount, deposit - claimAmount);
+    }
+// [KỊCH BẢN B.1] Chủ phát hiện hư hỏng, yêu cầu đền bù THÊM
+    function proposeDeduction(uint256 _damageAmount) public onlyOwner inState(State.Returned) {
+        uint256 totalClaim = claimAmount + _damageAmount;
+        require(totalClaim <= deposit, "Tong tien phat vuot qua tien coc.");
+
+        claimAmount = totalClaim; 
+        state = State.Negotiating; 
+
+        emit DamageClaimed(_damageAmount);
+    }
+// [KỊCH BẢN B.2] Khách ĐỒNG Ý đền bù hư hỏng
+    function acceptDeduction() public onlyRenter inState(State.Negotiating) {
+        state = State.Completed;
+
+        owner.transfer(rentPrice + claimAmount); 
+        renter.transfer(deposit - claimAmount);  
+
+        emit Completed(rentPrice + claimAmount, deposit - claimAmount);
+    }
+// [KỊCH BẢN C.1] Khách TỪ CHỐI đền bù -> Gọi Admin
+    function escalateToArbitrator() public onlyParty inState(State.Negotiating) {
+        state = State.Disputed; // Khoa cung tien, cho Admin xu
+        emit Disputed();
+    }
+// [KỊCH BẢN C.2] Admin kiểm tra bằng chứng và phán quyết số tiền bồi thường
+    function resolveDispute(uint256 _finalDeduction) public onlyArbitrator inState(State.Disputed) {
+        require(_finalDeduction <= deposit, "Muc phat vuot qua tien coc.");
+
+        state = State.Completed;
+
+        owner.transfer(rentPrice + _finalDeduction);
+        renter.transfer(deposit - _finalDeduction);
+
+        emit Completed(rentPrice + _finalDeduction, deposit - _finalDeduction);
+    }
+// [KỊCH BẢN D] BẢO VỆ CHỦ ĐỒ: Khách bỏ trốn -> Tịch thu toàn bộ sau thời gian Timeout
+    function emergencyClaim() public onlyOwner inState(State.Rented) {
+        require(block.timestamp > (rentEndTime + timeoutDuration), "Chua qua thoi han Timeout khong the tich thu.");
+
+        state = State.Completed;
+
+        owner.transfer(rentPrice + deposit);
+
+        emit EmergencyResolved();
+    }
+// [KỊCH BẢN E] BẢO VỆ KHÁCH THUÊ: Chủ đồ ngâm cọc -> Khách tự động ép chốt sổ
+    function forceCompleteByRenter() public onlyRenter inState(State.Returned) {
+        require(block.timestamp > (returnedTime + claimWindow), "Chua het thoi gian de Chu do kiem tra.");
+
+        state = State.Completed;
+
+        owner.transfer(rentPrice + claimAmount);      
+        renter.transfer(deposit - claimAmount);       
+
+        emit Completed(rentPrice + claimAmount, deposit - claimAmount);
+    }
+}
+// Phần 2: NHÀ MÁY (FACTORY - Nơi đúc ra các hợp đồng con)
+    contract RentalFactory {
+    address public platformAdmin; // Vi cua Admin (Tai khoan Deploy hop dong nay)
+
+    RentalAgreement[] public deployedAgreements;
+
+    event AgreementCreated(address contractAddress, address owner, uint256 rentPrice, uint256 deposit);
+
+    constructor() {
+        platformAdmin = msg.sender; 
+    }
+
+// Chu tai san dien form tren Web va an "Dang Cho Thue", Web se goi ham nay:
+   function createAgreement(
+        uint256 _rentPrice, 
+        uint256 _deposit, 
+        uint256 _claimWindow,
+        uint256 _timeoutDuration,
+        uint256 _lateFeePerDay
+    ) public {
+        
+        RentalAgreement newAgreement = new RentalAgreement(
+            msg.sender, 
+            platformAdmin, 
+            _rentPrice, 
+            _deposit, 
+            _claimWindow,
+            _timeoutDuration,
+            _lateFeePerDay
+        );
+
+        deployedAgreements.push(newAgreement);
+
+        emit AgreementCreated(address(newAgreement), msg.sender, _rentPrice, _deposit);
+    }
+
+    // Ham ho tro Web lay danh sach cac mon do dang dang cho thue
+    function getAgreements() public view returns (RentalAgreement[] memory) {
+        return deployedAgreements;
+    } 
+}
